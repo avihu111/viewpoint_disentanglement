@@ -18,7 +18,7 @@ setup(
   ],
   install_requires=[
     'axial_positional_embedding',
-    'DALL-E',
+    # 'DALL-E',
     'einops>=0.3',
     'ftfy',
     'g-mlp-pytorch',

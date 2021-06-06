@@ -210,13 +210,13 @@ class DiscreteVAE(nn.Module):
         recon_loss = self.loss_fn(img, out)
 
         # kl divergence
-
         logits = rearrange(logits, 'b n h w -> b (h w) n')
-        log_qy = F.log_softmax(logits, dim = -1)
+        softmax = F.softmax(logits, dim=-1)
+        mean_softmax = softmax.mean(dim=1)
+        log_qy = torch.log(mean_softmax)
         log_uniform = torch.log(torch.tensor([1. / num_tokens], device = device))
         kl_div = F.kl_div(log_uniform, log_qy, None, None, 'batchmean', log_target = True)
-
-        loss = recon_loss + (kl_div * kl_div_loss_weight)
+        loss = recon_loss + kl_div_loss_weight * kl_div
 
         if not return_recons:
             return loss
@@ -311,8 +311,8 @@ class DALLE(nn.Module):
         *,
         dim,
         vae,
-        num_text_tokens = 10000,
-        text_seq_len = 256,
+        num_frames = 10000,
+        text_seq_len = 16,
         depth,
         heads = 8,
         dim_head = 64,
@@ -321,35 +321,38 @@ class DALLE(nn.Module):
         ff_dropout = 0,
         sparse_attn = False,
         attn_types = None,
-        loss_img_weight = 7,
+        num_videos=10,
+        device=0
     ):
         super().__init__()
         assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE1024)), 'vae must be an instance of DiscreteVAE'
-
+        self.device = device
         image_size = vae.image_size
         num_image_tokens = vae.num_tokens
         image_fmap_size = (vae.image_size // (2 ** vae.num_layers))
         image_seq_len = image_fmap_size ** 2
+        num_embedding_tokens = num_videos + num_frames + text_seq_len
+        # reserve unique padding tokens for each position (text seq len)
+        # text emb is: (video_ids, frame_ids, pos_encodings)
+        # self.latent_params = nn.Embedding(num_embedding_tokens, dim)
+        self.per_frame_emb = torch.rand((num_frames, 1, dim), requires_grad=True).to(self.device)
+        self.per_video_emb = torch.rand((num_videos + 1, text_seq_len - 1, dim), requires_grad=True).to(self.device)
+        self.image_emb = nn.Embedding(num_image_tokens, dim).to(self.device)
 
-        num_text_tokens = num_text_tokens + text_seq_len  # reserve unique padding tokens for each position (text seq len)
+        self.text_pos_emb = nn.Embedding(text_seq_len + 1, dim).to(self.device) # +1 for <bos>
+        self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape = (image_fmap_size, image_fmap_size)).to(self.device)
 
-        self.text_emb = nn.Embedding(num_text_tokens, dim)
-        self.image_emb = nn.Embedding(num_image_tokens, dim)
-
-        self.text_pos_emb = nn.Embedding(text_seq_len + 1, dim) # +1 for <bos>
-        self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape = (image_fmap_size, image_fmap_size))
-
-        self.num_text_tokens = num_text_tokens # for offsetting logits index and calculating cross entropy loss
         self.num_image_tokens = num_image_tokens
 
-        self.text_seq_len = text_seq_len
+        self.text_seq_len = text_seq_len + 1
         self.image_seq_len = image_seq_len
 
-        seq_len = text_seq_len + image_seq_len
-        total_tokens = num_text_tokens + num_image_tokens
+        seq_len = self.text_seq_len + self.image_seq_len
+        total_tokens = num_embedding_tokens + num_image_tokens
         self.total_tokens = total_tokens
         self.total_seq_len = seq_len
-
+        self.frame_emb_regularization = 0.00001
+        self.noise_std = 0.1
         self.vae = vae
         set_requires_grad(self.vae, False) # freeze VAE from being trained
 
@@ -370,103 +373,61 @@ class DALLE(nn.Module):
 
         self.to_logits = nn.Sequential(
             nn.LayerNorm(dim),
-            nn.Linear(dim, self.total_tokens),
+            nn.Linear(dim, self.num_image_tokens),
         )
 
         seq_range = torch.arange(seq_len)
-        logits_range = torch.arange(total_tokens)
+        logits_range = torch.arange(self.num_image_tokens)
 
         seq_range = rearrange(seq_range, 'n -> () n ()')
         logits_range = rearrange(logits_range, 'd -> () () d')
 
         logits_mask = (
-            ((seq_range >= text_seq_len) & (logits_range < num_text_tokens)) |
-            ((seq_range < text_seq_len) & (logits_range >= num_text_tokens))
+                ((seq_range >= text_seq_len) & (logits_range < num_embedding_tokens)) |
+                ((seq_range < text_seq_len) & (logits_range >= num_embedding_tokens))
         )
+        logits_mask = (seq_range >= text_seq_len)
 
         self.register_buffer('logits_mask', logits_mask, persistent=False)
-        self.loss_img_weight = loss_img_weight
 
     @torch.no_grad()
     @eval_decorator
     def generate_images(
         self,
-        text,
+        frame_index,
+        video_index,
         *,
-        clip = None,
         mask = None,
         filter_thres = 0.5,
-        temperature = 1.,
-        img = None,
-        num_init_img_tokens = None
+        temperature = 1.
     ):
-        vae, text_seq_len, image_seq_len, num_text_tokens = self.vae, self.text_seq_len, self.image_seq_len, self.num_text_tokens
-        total_len = text_seq_len + image_seq_len
+        vae, text_seq_len, image_seq_len, = self.vae, self.text_seq_len, self.image_seq_len
 
-        text = text[:, :text_seq_len] # make sure text is within bounds
-        out = text
-
-        if exists(img):
-            image_size = vae.image_size
-            assert img.shape[1] == 3 and img.shape[2] == image_size and img.shape[3] == image_size, f'input image must have the correct image size {image_size}'
-
-            indices = vae.get_codebook_indices(img)
-            num_img_tokens = default(num_init_img_tokens, int(0.4375 * image_seq_len))  # OpenAI used 14 * 32 initial tokens to prime
-            assert num_img_tokens < image_seq_len, 'number of initial image tokens for priming must be less than the total image token sequence length'
-
-            indices = indices[:, :num_img_tokens]
-            out = torch.cat((out, indices), dim = -1)
-
-        for cur_len in range(out.shape[1], total_len):
-            is_image = cur_len >= text_seq_len
-
-            text, image = out[:, :text_seq_len], out[:, text_seq_len:]
-
-            logits = self(text, image, mask = mask)[:, -1, :]
-
+        out = torch.zeros((len(frame_index), self.image_seq_len), dtype=frame_index.dtype).cuda(self.device)
+        for cur_len in range(image_seq_len):
+            logits = self(image=out[:cur_len + text_seq_len], frame_indices=frame_index,
+                          video_indices=video_index)[:, cur_len + text_seq_len - 1, :]
             filtered_logits = top_k(logits, thres = filter_thres)
             probs = F.softmax(filtered_logits / temperature, dim = -1)
             sample = torch.multinomial(probs, 1)
-
-            sample -= (num_text_tokens if is_image else 0) # offset sampled token if it is an image token, since logit space is composed of text and then image tokens
-            out = torch.cat((out, sample), dim=-1)
-
-            if out.shape[1] <= text_seq_len:
-                mask = F.pad(mask, (0, 1), value = True)
-
-        text_seq = out[:, :text_seq_len]
+            out[:,cur_len] = sample# = torch.cat((out, sample), dim=-1)
 
         img_seq = out[:, -image_seq_len:]
         images = vae.decode(img_seq)
-
-        if exists(clip):
-            scores = clip(text_seq, images, return_loss = False)
-            return images, scores
 
         return images
 
     def forward(
         self,
-        text,
-        image = None,
-        mask = None,
-        return_loss = False
-    ):
-        assert text.shape[-1] == self.text_seq_len, f'the length {text.shape[-1]} of the text tokens you passed in does not have the correct length ({self.text_seq_len})'
-        device, total_seq_len = text.device, self.total_seq_len
+        image=None, video_indices=None, frame_indices=None, return_loss = False):
+        image = image.cuda(self.device)
+        bos_embs = self.per_video_emb[torch.full_like(video_indices, -1)].cuda(self.device)
+        video_embs = self.per_video_emb[video_indices].cuda(self.device)
+        frame_embs = self.per_frame_emb[frame_indices].cuda(self.device)
 
-        # make sure padding in text tokens get unique padding token id
-
-        text_range = torch.arange(self.text_seq_len, device = device) + (self.num_text_tokens - self.text_seq_len)
-        text = torch.where(text == 0, text_range, text)
-
-        # add <bos>
-
-        text = F.pad(text, (1, 0), value = 0)
-
-        tokens = self.text_emb(text)
-        tokens += self.text_pos_emb(torch.arange(text.shape[1], device = device))
-
+        # frame_embs += torch.rand(frame_embs.shape).cuda(self.device) * self.noise_std
+        tokens = torch.cat([bos_embs, video_embs, frame_embs], dim=1).cuda(self.device)
+        tokens += self.text_pos_emb(torch.arange(self.text_seq_len).cuda(self.device)).unsqueeze(0)
         seq_len = tokens.shape[1]
 
         if exists(image) and not is_empty(image):
@@ -480,41 +441,23 @@ class DALLE(nn.Module):
 
             image_len = image.shape[1]
             image_emb = self.image_emb(image)
-
             image_emb += self.image_pos_emb(image_emb)
-
             tokens = torch.cat((tokens, image_emb), dim = 1)
-
             seq_len += image_len
 
         # when training, if the length exceeds the total text + image length
         # remove the last token, since it needs not to be trained
-
-        if tokens.shape[1] > total_seq_len:
+        if tokens.shape[1] > self.total_seq_len:
             seq_len -= 1
             tokens = tokens[:, :-1]
 
         out = self.transformer(tokens)
         logits = self.to_logits(out)
-
-        # mask logits to make sure text predicts text (except last token), and image predicts image
-
-        logits_mask = self.logits_mask[:, :seq_len]
-        max_neg_value = -torch.finfo(logits.dtype).max
-        logits.masked_fill_(logits_mask, max_neg_value)
-
         if not return_loss:
             return logits
 
         assert exists(image), 'when training, image must be supplied'
-
-        offsetted_image = image + self.num_text_tokens
-        labels = torch.cat((text[:, 1:], offsetted_image), dim = 1)
-
-        logits = rearrange(logits, 'b n c -> b c n')
-
-        loss_text = F.cross_entropy(logits[:, :, :self.text_seq_len], labels[:, :self.text_seq_len])
-        loss_img = F.cross_entropy(logits[:, :, self.text_seq_len:], labels[:, self.text_seq_len:])
-
-        loss = (loss_text + self.loss_img_weight * loss_img) / (self.loss_img_weight + 1)
-        return loss
+        logits = rearrange(logits, 'b n c -> b c n')[...,self.text_seq_len -1:-1]
+        loss_img = F.cross_entropy(logits, image)
+        frame_emb_loss = (frame_embs ** 2).mean()
+        return loss_img + self.frame_emb_regularization * frame_emb_loss

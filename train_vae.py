@@ -25,7 +25,8 @@ from dalle_pytorch import DiscreteVAE
 
 parser = argparse.ArgumentParser()
 
-parser.add_argument('--image_folder', type = str, required = True,
+parser.add_argument('--image_folder', type = str,
+                    default ='dataset/train/',
                     help='path to your folder of images for learning the discrete VAE and its codebook')
 
 parser.add_argument('--image_size', type = int, required = False, default = 128,
@@ -36,9 +37,9 @@ parser = distributed_utils.wrap_arg_parser(parser)
 
 train_group = parser.add_argument_group('Training settings')
 
-train_group.add_argument('--epochs', type = int, default = 20, help = 'number of epochs')
+train_group.add_argument('--epochs', type = int, default = 200, help = 'number of epochs')
 
-train_group.add_argument('--batch_size', type = int, default = 8, help = 'batch size')
+train_group.add_argument('--batch_size', type = int, default = 48, help = 'batch size')
 
 train_group.add_argument('--learning_rate', type = float, default = 1e-3, help = 'learning rate')
 
@@ -67,6 +68,7 @@ model_group.add_argument('--emb_dim', type = int, default = 512, help = 'embeddi
 model_group.add_argument('--hidden_dim', type = int, default = 256, help = 'hidden dimension')
 
 model_group.add_argument('--kl_loss_weight', type = float, default = 0., help = 'KL loss weight')
+model_group.add_argument('--device', type = int, default = 0, help = 'cuda device')
 
 args = parser.parse_args()
 
@@ -74,7 +76,7 @@ args = parser.parse_args()
 
 IMAGE_SIZE = args.image_size
 IMAGE_PATH = args.image_folder
-
+DEVICE = args.device
 EPOCHS = args.epochs
 BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.learning_rate
@@ -138,7 +140,7 @@ vae = DiscreteVAE(
     kl_div_loss_weight = KL_LOSS_WEIGHT
 )
 if not using_deepspeed:
-    vae = vae.cuda()
+    vae = vae.cuda(DEVICE)
 
 
 assert len(ds) > 0, 'folder does not contain any images'
@@ -213,7 +215,7 @@ temp = STARTING_TEMP
 
 for epoch in range(EPOCHS):
     for i, (images, _) in enumerate(distr_dl):
-        images = images.cuda()
+        images = images.cuda(DEVICE)
 
         loss, recons = distr_vae(
             images,
