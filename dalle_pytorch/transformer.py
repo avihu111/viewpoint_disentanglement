@@ -26,6 +26,15 @@ def cast_tuple(val, depth = 1):
 
 # classes
 
+class DivideMax(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        maxes = x.amax(dim = self.dim, keepdim = True)
+        return x / maxes
+
 # https://arxiv.org/abs/2103.17239
 class LayerScale(nn.Module):
     def __init__(self, dim, depth, fn):
@@ -86,7 +95,8 @@ class Transformer(nn.Module):
         ff_dropout = 0.,
         attn_types = None,
         image_fmap_size = None,
-        sparse_attn = False
+        sparse_attn = False,
+        stable = False
     ):
         super().__init__()
         layers = nn.ModuleList([])
@@ -98,15 +108,15 @@ class Transformer(nn.Module):
 
         for ind, sparse_attn, attn_type in zip(range(depth), sparse_layer, attn_type_layer):
             if attn_type == 'full':
-                attn_class = Attention
+                attn_class = partial(Attention, stable = stable)
             elif attn_type == 'sparse':
                 attn_class = SparseAttention
             elif attn_type == 'axial_row':
-                attn_class = partial(SparseAxialCausalAttention, seq_len = seq_len, axis = 0, image_size = image_fmap_size)
+                attn_class = partial(SparseAxialCausalAttention, seq_len = seq_len, axis = 0, image_size = image_fmap_size, stable = stable)
             elif attn_type == 'axial_col':
-                attn_class = partial(SparseAxialCausalAttention, seq_len = seq_len, axis = 1, image_size = image_fmap_size)
+                attn_class = partial(SparseAxialCausalAttention, seq_len = seq_len, axis = 1, image_size = image_fmap_size, stable = stable)
             elif attn_type == 'conv_like':
-                attn_class = partial(SparseConvCausalAttention, seq_len = seq_len, image_size = image_fmap_size)
+                attn_class = partial(SparseConvCausalAttention, seq_len = seq_len, image_size = image_fmap_size, stable = stable)
             elif attn_type == 'mlp':
                 attn_class = partial(gMLPBlock, seq_len = seq_len)
             else:

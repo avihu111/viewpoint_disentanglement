@@ -1,5 +1,6 @@
 import argparse
 from pathlib import Path
+import time
 
 import torch
 import wandb  # Quit early if user doesn't have wandb installed.
@@ -43,8 +44,18 @@ parser.add_argument('--hug', dest='hug', action='store_true')
 parser.add_argument('--bpe_path', type=str,
                     help='path to your BPE json file')
 
+parser.add_argument('--dalle_output_file_name', type=str, default = "dalle",
+                    help='output_file_name')
+
 parser.add_argument('--fp16', action='store_true',
                     help='(experimental) - Enable DeepSpeed 16 bit precision. Reduces VRAM.')
+
+
+parser.add_argument(
+	'--amp',
+	action='store_true',
+	help='Apex "O1" automatic mixed precision. More stable than 16 bit precision. Can\'t be used in conjunction with deepspeed zero stages 1-3.'
+)
 
 parser.add_argument('--wandb_name', default='dalle_train_transformer',
                     help='Name W&B will use when saving results.\ne.g. `--wandb_name "coco2017-full-sparse"`')
@@ -55,7 +66,11 @@ train_group = parser.add_argument_group('Training settings')
 
 train_group.add_argument('--epochs', default = 20, type = int, help = 'Number of epochs')
 
+train_group.add_argument('--save_every_n_steps', default = 1000, type = int, help = 'Save a checkpoint every n steps')
+
 train_group.add_argument('--batch_size', default = 4, type = int, help = 'Batch size')
+
+train_group.add_argument('--ga_steps', default = 1, type = int, help = 'Number of steps to accumulate gradients across per each iteration. DeepSpeed only.')
 
 train_group.add_argument('--learning_rate', default = 3e-4, type = float, help = 'Learning rate')
 
@@ -109,6 +124,8 @@ def cp_path_to_dir(cp_path, tag):
 
 # constants
 
+DALLE_OUTPUT_FILE_NAME = args.dalle_output_file_name + ".pt"
+
 VAE_PATH = args.vae_path
 DALLE_PATH = args.dalle_path
 RESUME = exists(DALLE_PATH)
@@ -119,6 +136,7 @@ BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.learning_rate
 GRAD_CLIP_NORM = args.clip_grad_norm
 LR_DECAY = args.lr_decay
+SAVE_EVERY_N_STEPS = args.save_every_n_steps
 
 MODEL_DIM = args.dim
 TEXT_SEQ_LEN = args.text_seq_len
@@ -309,11 +327,23 @@ if distr_backend.is_root_worker():
 distr_backend.check_batch_size(BATCH_SIZE)
 deepspeed_config = {
     'train_batch_size': BATCH_SIZE,
+    'gradient_accumulation_steps': args.ga_steps,
     'gradient_clipping': GRAD_CLIP_NORM,
     'fp16': {
         'enabled': args.fp16,
     },
+    'amp': {
+        'enabled': args.amp,
+        'opt_level': 'O1',
+    },
 }
+
+if deepspeed_config.get('zero_optimization', {}).get('stage', 0) >= 2:
+    print(f"Checkpoints made with DeepSpeed ZeRO Stages 2 and 3 will be stored in deepspeed checkpoint folder")
+    print(f"As such, they will require DeepSpeed as a dependency in order to resume from or generate with.")
+    print("See the deespeed conversion script for details on how to convert your ZeRO stage 2/3 checkpoint to a single file.")
+    print("If using a single GPU, consider running with apex automatic mixed precision instead for a similar speedup to ZeRO.")
+    time.sleep(2)
 
 (distr_dalle, distr_opt, distr_dl, distr_scheduler) = distr_backend.distribute(
     args=args,
@@ -355,7 +385,8 @@ def save_model(path):
             ),
         }
         torch.save(save_obj, str(cp_dir / DEEPSPEED_CP_AUX_FILENAME))
-        return
+        if deepspeed_config.get('zero_optimization', {}).get('stage', 0) >= 2: # see https://github.com/lucidrains/DALLE-pytorch/wiki/DeepSpeed-Checkpoints
+            return
 
     if not distr_backend.is_root_worker():
         return
@@ -369,10 +400,16 @@ def save_model(path):
 
 # training
 
+# Saves a checkpoint before training begins to fail early when mis-configured. 
+# See https://github.com/lucidrains/DALLE-pytorch/wiki/DeepSpeed-Checkpoints
+save_model(DALLE_OUTPUT_FILE_NAME)
+
 for epoch in range(EPOCHS):
     if data_sampler:
         data_sampler.set_epoch(epoch)
     for i, (text, images) in enumerate(distr_dl):
+        if i % 10 == 0 and distr_backend.is_root_worker():
+            t = time.time()
         if args.fp16:
             images = images.half()
         text, images = map(lambda t: t.cuda(), (text, images))
@@ -404,6 +441,9 @@ for epoch in range(EPOCHS):
                 'loss': avg_loss.item()
             }
 
+        if i % SAVE_EVERY_N_STEPS == 0:
+            save_model(DALLE_OUTPUT_FILE_NAME)
+	
         if i % 100 == 0:
             if distr_backend.is_root_worker():
                 sample_text = text[:1]
@@ -414,7 +454,6 @@ for epoch in range(EPOCHS):
                     # CUDA index errors when we don't guard this
                     image = dalle.generate_images(text[:1], filter_thres=0.9)  # topk sampling at 0.9
 
-                wandb.save(f'./dalle.pt')
 
                 log = {
                     **log,
@@ -422,7 +461,11 @@ for epoch in range(EPOCHS):
                 if not avoid_model_calls:
                     log['image'] = wandb.Image(image, caption=decoded_text)
 
-            save_model(f'./dalle.pt')
+
+        if i % 10 == 9 and distr_backend.is_root_worker():
+            sample_per_sec = BATCH_SIZE * 10 / (time.time() - t)
+            log["sample_per_sec"] = sample_per_sec
+            print(epoch, i, f'sample_per_sec - {sample_per_sec}')
 
         if distr_backend.is_root_worker():
             wandb.log(log)
@@ -430,20 +473,22 @@ for epoch in range(EPOCHS):
     if LR_DECAY and not using_deepspeed:
         # Scheduler is automatically progressed after the step when
         # using DeepSpeed.
-        distr_scheduler.step(loss)
+        distr_scheduler.step(avg_loss)
 
+    save_model(DALLE_OUTPUT_FILE_NAME)
+    
     if distr_backend.is_root_worker():
         # save trained model to wandb as an artifact every epoch's end
 
         model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
-        model_artifact.add_file('dalle.pt')
+        model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
         run.log_artifact(model_artifact)
 
-save_model(f'./dalle-final.pt')
+save_model(DALLE_OUTPUT_FILE_NAME)
 if distr_backend.is_root_worker():
-    wandb.save('./dalle-final.pt')
+    wandb.save(DALLE_OUTPUT_FILE_NAME)
     model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
-    model_artifact.add_file('dalle-final.pt')
+    model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
     run.log_artifact(model_artifact)
 
     wandb.finish()

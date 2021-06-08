@@ -438,10 +438,31 @@ for each one. See the [DeepSpeed configuration
 docs](https://www.deepspeed.ai/docs/config-json/) for more
 information.
 
+#### DeepSpeed - 32 and 16 bit Precision
 As of DeepSpeed version 0.3.16, ZeRO optimizations can be used with
 single-precision floating point numbers. If you are using an older
 version, you'll have to pass the `--fp16` flag to be able to enable
 ZeRO optimizations.
+
+
+#### DeepSpeed - Apex Automatic Mixed Precision.
+Automatic mixed precision is a stable alternative to fp16 which still provides a decent speedup.
+In order to run with Apex AMP (through DeepSpeed), you will need to install DeepSpeed using either the Dockerfile or the bash script.
+
+Then you will need to install apex from source. 
+This may take awhile and you may see some compilation warnings which can be ignored. 
+```sh
+sh install_apex.sh
+```
+
+Now, run `train_dalle.py` with `deepspeed` instead of `python` as done here:
+```sh
+deepspeed train_dalle.py \
+    --taming \
+    --image_text_folder 'DatasetsDir' \
+    --distr_backend 'deepspeed' \
+    --amp
+```
 
 #### Horovod
 
@@ -539,6 +560,17 @@ $ python generate.py --chinese --text '追老鼠的猫'
     author  = {Patrick Esser and Robin Rombach and Björn Ommer},
     year    = {2021},
     eprint  = {2012.09841},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CV}
+}
+```
+
+```bibtex
+@misc{ding2021cogview,
+    title   = {CogView: Mastering Text-to-Image Generation via Transformers},
+    author  = {Ming Ding and Zhuoyi Yang and Wenyi Hong and Wendi Zheng and Chang Zhou and Da Yin and Junyang Lin and Xu Zou and Zhou Shao and Hongxia Yang and Jie Tang},
+    year    = {2021},
+    eprint  = {2105.13290},
     archivePrefix = {arXiv},
     primaryClass = {cs.CV}
 }
