@@ -2,7 +2,7 @@ import math
 from math import sqrt
 import argparse
 from pathlib import Path
-
+import numpy as np
 # torch
 
 import torch
@@ -15,11 +15,11 @@ from torchvision import transforms as T
 from torch.utils.data import DataLoader
 from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
-
+from real_estate import RealEstate10K
 # dalle classes and utils
 
 from dalle_pytorch import distributed_utils
-from dalle_pytorch import DiscreteVAE
+from dalle_pytorch import DiscreteVAE, OpenAIDiscreteVAE
 
 # argument parsing
 
@@ -29,17 +29,26 @@ parser.add_argument('--image_folder', type = str,
                     default ='dataset/train/',
                     help='path to your folder of images for learning the discrete VAE and its codebook')
 
+parser.add_argument('--pretrained_path', type = str,
+                    default ='vae_17Jun_0950.pt',
+                    help='path to pretrained model')
+
 parser.add_argument('--image_size', type = int, required = False, default = 128,
                     help='image size')
+parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', type=float, default=0.75,
+                    help='Random resized crop lower ratio')
 
 parser = distributed_utils.wrap_arg_parser(parser)
 
+parser.add_argument('--output_model_name', type = str,
+                    default ='vae_17Jun_1720',
+                    help='path to pretrained model')
 
 train_group = parser.add_argument_group('Training settings')
 
-train_group.add_argument('--epochs', type = int, default = 200, help = 'number of epochs')
+train_group.add_argument('--epochs', type = int, default = 1000, help = 'number of epochs')
 
-train_group.add_argument('--batch_size', type = int, default = 48, help = 'batch size')
+train_group.add_argument('--batch_size', type = int, default = 64, help = 'batch size')
 
 train_group.add_argument('--learning_rate', type = float, default = 1e-3, help = 'learning rate')
 
@@ -55,9 +64,9 @@ train_group.add_argument('--num_images_save', type = int, default = 4, help = 'n
 
 model_group = parser.add_argument_group('Model settings')
 
-model_group.add_argument('--num_tokens', type = int, default = 8192, help = 'number of image tokens')
+model_group.add_argument('--num_tokens', type = int, default = 4096, help = 'number of image tokens')
 
-model_group.add_argument('--num_layers', type = int, default = 3, help = 'number of layers (should be 3 or above)')
+model_group.add_argument('--num_layers', type = int, default = 4, help = 'number of layers (should be 3 or above)')
 
 model_group.add_argument('--num_resnet_blocks', type = int, default = 2, help = 'number of residual net blocks')
 
@@ -67,7 +76,7 @@ model_group.add_argument('--emb_dim', type = int, default = 512, help = 'embeddi
 
 model_group.add_argument('--hidden_dim', type = int, default = 256, help = 'hidden dimension')
 
-model_group.add_argument('--kl_loss_weight', type = float, default = 0., help = 'KL loss weight')
+model_group.add_argument('--kl_loss_weight', type = float, default = 0, help = 'KL loss weight')
 model_group.add_argument('--device', type = int, default = 0, help = 'cuda device')
 
 args = parser.parse_args()
@@ -75,6 +84,7 @@ args = parser.parse_args()
 # constants
 
 IMAGE_SIZE = args.image_size
+PRETRAINED_PATH = args.pretrained_path
 IMAGE_PATH = args.image_folder
 DEVICE = args.device
 EPOCHS = args.epochs
@@ -89,7 +99,7 @@ SMOOTH_L1_LOSS = args.smooth_l1_loss
 EMB_DIM = args.emb_dim
 HIDDEN_DIM = args.hidden_dim
 KL_LOSS_WEIGHT = args.kl_loss_weight
-
+OUTPUT_MODEL_NAME = args.output_model_name
 STARTING_TEMP = args.starting_temp
 TEMP_MIN = args.temp_min
 ANNEAL_RATE = args.anneal_rate
@@ -105,16 +115,14 @@ using_deepspeed = \
     distributed_utils.using_backend(distributed_utils.DeepSpeedBackend)
 
 # data
+ds = RealEstate10K(
+    root='./dataset',
+    transform=T.Compose([T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+                         T.RandomResizedCrop(IMAGE_SIZE, scale=(args.resize_ratio, 1.), ratio=(1., 1.)),
+                         T.ToTensor()
+    ]), split='train', return_indices=False)
+print('working with {} frames from {} videos'.format(len(ds), len(np.unique(ds.targets))))
 
-ds = ImageFolder(
-    IMAGE_PATH,
-    T.Compose([
-        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-        T.Resize(IMAGE_SIZE),
-        T.CenterCrop(IMAGE_SIZE),
-        T.ToTensor()
-    ])
-)
 
 if distributed_utils.using_backend(distributed_utils.HorovodBackend):
     data_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -139,6 +147,13 @@ vae = DiscreteVAE(
     smooth_l1_loss = SMOOTH_L1_LOSS,
     kl_div_loss_weight = KL_LOSS_WEIGHT
 )
+if PRETRAINED_PATH:
+    pretrained_vae = torch.load(PRETRAINED_PATH)
+    vae.load_state_dict(state_dict=pretrained_vae['weights'])
+else:
+    pretrained_vae = OpenAIDiscreteVAE()
+    print()
+
 if not using_deepspeed:
     vae = vae.cuda(DEVICE)
 
@@ -214,16 +229,16 @@ global_step = 0
 temp = STARTING_TEMP
 
 for epoch in range(EPOCHS):
-    for i, (images, _) in enumerate(distr_dl):
+    for i, images in enumerate(distr_dl):
         images = images.cuda(DEVICE)
 
-        loss, recons = distr_vae(
+        recon_loss, kl_loss, recons = distr_vae(
             images,
             return_loss = True,
             return_recons = True,
             temp = temp
         )
-
+        loss = recon_loss + kl_loss
         if using_deepspeed:
             # Gradients are automatically zeroed after the step
             distr_vae.backward(loss)
@@ -256,8 +271,8 @@ for epoch in range(EPOCHS):
                     'temperature':          temp
                 }
 
-                wandb.save('./vae.pt')
-            save_model(f'./vae.pt')
+                wandb.save(f'./{OUTPUT_MODEL_NAME}.pt')
+            save_model(f'./{OUTPUT_MODEL_NAME}.pt')
 
             # temperature anneal
 
@@ -283,6 +298,8 @@ for epoch in range(EPOCHS):
                     'epoch': epoch,
                     'iter': i,
                     'loss': avg_loss.item(),
+                    'recon_loss': recon_loss,
+                    'kl_loss': kl_loss,
                     'lr': lr
                 }
 
@@ -293,17 +310,17 @@ for epoch in range(EPOCHS):
         # save trained model to wandb as an artifact every epoch's end
 
         model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
-        model_artifact.add_file('vae.pt')
-        run.log_artifact(model_artifact)
+        model_artifact.add_file(f'{OUTPUT_MODEL_NAME}.pt')
+        # run.log_artifact(model_artifact)
 
 if distr_backend.is_root_worker():
     # save final vae and cleanup
 
-    save_model('./vae-final.pt')
-    wandb.save('./vae-final.pt')
+    save_model(f'./{OUTPUT_MODEL_NAME}-final.pt')
+    wandb.save(f'./{OUTPUT_MODEL_NAME}-final.pt')
 
     model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
-    model_artifact.add_file('vae-final.pt')
+    model_artifact.add_file(f'{OUTPUT_MODEL_NAME}-final.pt')
     run.log_artifact(model_artifact)
 
     wandb.finish()

@@ -137,6 +137,7 @@ class DiscreteVAE(nn.Module):
         self.normalization = normalization
 
         self._register_external_parameters()
+        self.iterations = 0
 
     def _register_external_parameters(self):
         """Register external parameters for DeepSpeed partitioning."""
@@ -216,12 +217,16 @@ class DiscreteVAE(nn.Module):
         log_qy = torch.log(mean_softmax)
         log_uniform = torch.log(torch.tensor([1. / num_tokens], device = device))
         kl_div = F.kl_div(log_uniform, log_qy, None, None, 'batchmean', log_target = True)
-        loss = recon_loss + kl_div_loss_weight * kl_div
+        if self.iterations < 1000:
 
+            loss = recon_loss
+        else:
+            loss = recon_loss + kl_div_loss_weight * kl_div
+        self.iterations += 1
         if not return_recons:
             return loss
 
-        return loss, out
+        return recon_loss, kl_div_loss_weight * kl_div, out
 
 # main classes
 
@@ -321,38 +326,29 @@ class DALLE(nn.Module):
         ff_dropout = 0,
         sparse_attn = False,
         attn_types = None,
-        num_videos=10,
-        device=0
+        num_videos=10
     ):
         super().__init__()
         assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE1024)), 'vae must be an instance of DiscreteVAE'
-        self.device = device
-        image_size = vae.image_size
         num_image_tokens = vae.num_tokens
         image_fmap_size = (vae.image_size // (2 ** vae.num_layers))
         image_seq_len = image_fmap_size ** 2
         num_embedding_tokens = num_videos + num_frames + text_seq_len
         # reserve unique padding tokens for each position (text seq len)
-        # text emb is: (video_ids, frame_ids, pos_encodings)
-        # self.latent_params = nn.Embedding(num_embedding_tokens, dim)
-        self.per_frame_emb = torch.rand((num_frames, 1, dim), requires_grad=True).to(self.device)
-        self.per_video_emb = torch.rand((num_videos + 1, text_seq_len - 1, dim), requires_grad=True).to(self.device)
-        self.image_emb = nn.Embedding(num_image_tokens, dim).to(self.device)
-
-        self.text_pos_emb = nn.Embedding(text_seq_len + 1, dim).to(self.device) # +1 for <bos>
-        self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape = (image_fmap_size, image_fmap_size)).to(self.device)
-
+        self.per_frame_emb = nn.Embedding(num_frames + 1, dim)
+        self.per_video_emb = nn.Embedding(num_videos, dim * (text_seq_len -1))
+        self.image_emb = nn.Embedding(num_image_tokens, dim)
+        self.text_pos_emb = nn.Embedding(text_seq_len + 1, dim) # +1 for <bos>
+        self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape = (image_fmap_size, image_fmap_size))
         self.num_image_tokens = num_image_tokens
-
         self.text_seq_len = text_seq_len + 1
         self.image_seq_len = image_seq_len
-
+        self.dim = dim
         seq_len = self.text_seq_len + self.image_seq_len
-        total_tokens = num_embedding_tokens + num_image_tokens
-        self.total_tokens = total_tokens
+
         self.total_seq_len = seq_len
-        self.frame_emb_regularization = 0.00001
-        self.noise_std = 0.1
+        self.frame_emb_regularization = 0.001 # as in lord
+        self.noise_std = 1 # as in lord
         self.vae = vae
         set_requires_grad(self.vae, False) # freeze VAE from being trained
 
@@ -376,20 +372,6 @@ class DALLE(nn.Module):
             nn.Linear(dim, self.num_image_tokens),
         )
 
-        seq_range = torch.arange(seq_len)
-        logits_range = torch.arange(self.num_image_tokens)
-
-        seq_range = rearrange(seq_range, 'n -> () n ()')
-        logits_range = rearrange(logits_range, 'd -> () () d')
-
-        logits_mask = (
-                ((seq_range >= text_seq_len) & (logits_range < num_embedding_tokens)) |
-                ((seq_range < text_seq_len) & (logits_range >= num_embedding_tokens))
-        )
-        logits_mask = (seq_range >= text_seq_len)
-
-        self.register_buffer('logits_mask', logits_mask, persistent=False)
-
     @torch.no_grad()
     @eval_decorator
     def generate_images(
@@ -397,20 +379,19 @@ class DALLE(nn.Module):
         frame_index,
         video_index,
         *,
-        mask = None,
         filter_thres = 0.5,
         temperature = 1.
     ):
         vae, text_seq_len, image_seq_len, = self.vae, self.text_seq_len, self.image_seq_len
-
-        out = torch.zeros((len(frame_index), self.image_seq_len), dtype=frame_index.dtype).cuda(self.device)
+        device = frame_index.device
+        out = torch.zeros((len(frame_index), self.image_seq_len), dtype=frame_index.dtype).cuda(device)
         for cur_len in range(image_seq_len):
             logits = self(image=out[:cur_len + text_seq_len], frame_indices=frame_index,
                           video_indices=video_index)[:, cur_len + text_seq_len - 1, :]
             filtered_logits = top_k(logits, thres = filter_thres)
             probs = F.softmax(filtered_logits / temperature, dim = -1)
             sample = torch.multinomial(probs, 1)
-            out[:,cur_len] = sample# = torch.cat((out, sample), dim=-1)
+            out[:, cur_len] = sample[:,0]
 
         img_seq = out[:, -image_seq_len:]
         images = vae.decode(img_seq)
@@ -420,14 +401,15 @@ class DALLE(nn.Module):
     def forward(
         self,
         image=None, video_indices=None, frame_indices=None, return_loss = False):
-        image = image.cuda(self.device)
-        bos_embs = self.per_video_emb[torch.full_like(video_indices, -1)].cuda(self.device)
-        video_embs = self.per_video_emb[video_indices].cuda(self.device)
-        frame_embs = self.per_frame_emb[frame_indices].cuda(self.device)
-
-        # frame_embs += torch.rand(frame_embs.shape).cuda(self.device) * self.noise_std
-        tokens = torch.cat([bos_embs, video_embs, frame_embs], dim=1).cuda(self.device)
-        tokens += self.text_pos_emb(torch.arange(self.text_seq_len).cuda(self.device)).unsqueeze(0)
+        device = image.device
+        bs = len(video_indices)
+        bos_index = torch.full_like(frame_indices, self.per_frame_emb.num_embeddings - 1)
+        bos_embs = self.per_frame_emb(bos_index).cuda(device).unsqueeze(1)
+        video_embs = self.per_video_emb(video_indices).cuda(device).view(bs, -1, self.dim)
+        frame_embs = self.per_frame_emb(frame_indices).cuda(device).unsqueeze(1)
+        noisy_embs = frame_embs + torch.normal(0, self.noise_std, size=frame_embs.shape).cuda(device)
+        tokens = torch.cat([bos_embs, video_embs, noisy_embs], dim=1).cuda(device)
+        tokens += self.text_pos_emb(torch.arange(self.text_seq_len).cuda(device)).unsqueeze(0)
         seq_len = tokens.shape[1]
 
         if exists(image) and not is_empty(image):
@@ -455,9 +437,9 @@ class DALLE(nn.Module):
         logits = self.to_logits(out)
         if not return_loss:
             return logits
-
+        labels = image
         assert exists(image), 'when training, image must be supplied'
-        logits = rearrange(logits, 'b n c -> b c n')[...,self.text_seq_len -1:-1]
-        loss_img = F.cross_entropy(logits, image)
+        logits = rearrange(logits, 'b n c -> b c n')
+        loss_img = F.cross_entropy(logits[..., self.text_seq_len - 1: -1], labels)
         frame_emb_loss = (frame_embs ** 2).mean()
-        return loss_img + self.frame_emb_regularization * frame_emb_loss
+        return loss_img, self.frame_emb_regularization * frame_emb_loss

@@ -1,29 +1,33 @@
 import argparse
 from pathlib import Path
-import numpy as np
+import time
 import torch
+import torchvision.utils
 import wandb  # Quit early if user doesn't have wandb installed.
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
-import os
 from torchvision import transforms as T
-from torchvision.datasets import ImageFolder
 from dalle_pytorch import OpenAIDiscreteVAE, VQGanVAE1024, DiscreteVAE, DALLE
 from dalle_pytorch import distributed_utils
-import matplotlib.pyplot as plt
+
 # argument parsing
+from real_estate import RealEstate10K
+
+
+torch.hub.set_dir('/cs/labs/daphna/avihu.dekel/.cache/')
+
 
 parser = argparse.ArgumentParser()
 
 group = parser.add_mutually_exclusive_group(required=False)
 
-group.add_argument('--vae_path', type=str, default='vae_19.pt',
+group.add_argument('--vae_path', type=str, default=None,
                    help='path to your trained discrete VAE')
 
 group.add_argument('--dalle_path', type=str,
-                   default='dalle.pt',
+                   default=None,
                    help='path to your partially trained DALL-E')
 
 parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', type=float, default=0.75,
@@ -34,8 +38,18 @@ parser.add_argument('--taming', dest='taming', action='store_true')
 parser.add_argument('--fp16', action='store_true',
                     help='(experimental) - Enable DeepSpeed 16 bit precision. Reduces VRAM.')
 
+
+parser.add_argument(
+	'--amp',
+	action='store_true',
+	help='Apex "O1" automatic mixed precision. More stable than 16 bit precision. Can\'t be used in conjunction with deepspeed zero stages 1-3.'
+)
+
 parser.add_argument('--wandb_name', default='dalle_train_transformer',
                     help='Name W&B will use when saving results.\ne.g. `--wandb_name "coco2017-full-sparse"`')
+
+parser.add_argument('--dalle_output_file_name', type=str, default = "dalle_small_taming",
+                    help='output_file_name')
 
 parser = distributed_utils.wrap_arg_parser(parser)
 
@@ -43,9 +57,13 @@ train_group = parser.add_argument_group('Training settings')
 
 train_group.add_argument('--epochs', default = 500, type = int, help = 'Number of epochs')
 
-train_group.add_argument('--batch_size', default = 64, type = int, help = 'Batch size')
+train_group.add_argument('--save_every_n_steps', default = 5000, type = int, help = 'Save a checkpoint every n steps')
 
-train_group.add_argument('--learning_rate', default = 1e-4, type = float, help = 'Learning rate')
+train_group.add_argument('--batch_size', default = 128, type = int, help = 'Batch size')
+
+train_group.add_argument('--ga_steps', default = 1, type = int, help = 'Number of steps to accumulate gradients across per each iteration. DeepSpeed only.')
+
+train_group.add_argument('--learning_rate', default = 1e-3, type = float, help = 'Learning rate')
 
 train_group.add_argument('--clip_grad_norm', default = 0.5, type = float, help = 'Clip gradient norm')
 
@@ -53,20 +71,19 @@ train_group.add_argument('--lr_decay', dest = 'lr_decay', action = 'store_true')
 
 model_group = parser.add_argument_group('Model settings')
 
-model_group.add_argument('--dim', default = 512, type = int, help = 'Model dimension')
+model_group.add_argument('--dim', default = 256, type = int, help = 'Model dimension')
 
-model_group.add_argument('--text_seq_len', default =2, type = int, help = 'Text sequence length')
+model_group.add_argument('--text_seq_len', default =10, type = int, help = 'Text sequence length')
 
-model_group.add_argument('--depth', default = 2, type = int, help = 'Model depth')
+model_group.add_argument('--depth', default = 4, type = int, help = 'Model depth')
 
-model_group.add_argument('--heads', default = 8, type = int, help = 'Model number of heads')
+model_group.add_argument('--heads', default = 4, type = int, help = 'Model number of heads')
 
 model_group.add_argument('--dim_head', default = 64, type = int, help = 'Model head dimension')
 
 model_group.add_argument('--reversible', dest = 'reversible', action='store_true')
 
 model_group.add_argument('--attn_types', default = 'full', type = str, help = 'comma separated list of attention types. attention type can be: full or sparse or axial_row or axial_col or conv_like.')
-model_group.add_argument('--device', default =0, type = int, help = 'cuda device')
 
 args = parser.parse_args()
 
@@ -96,6 +113,8 @@ def cp_path_to_dir(cp_path, tag):
 
 # constants
 
+DALLE_OUTPUT_FILE_NAME = args.dalle_output_file_name + ".pt"
+
 VAE_PATH = args.vae_path
 DALLE_PATH = args.dalle_path
 RESUME = exists(DALLE_PATH)
@@ -106,6 +125,7 @@ BATCH_SIZE = args.batch_size
 LEARNING_RATE = args.learning_rate
 GRAD_CLIP_NORM = args.clip_grad_norm
 LR_DECAY = args.lr_decay
+SAVE_EVERY_N_STEPS = args.save_every_n_steps
 
 MODEL_DIM = args.dim
 TEXT_SEQ_LEN = args.text_seq_len
@@ -114,7 +134,6 @@ HEADS = args.heads
 DIM_HEAD = args.dim_head
 REVERSIBLE = args.reversible
 ATTN_TYPES = tuple(args.attn_types.split(','))
-DEVICE = args.device
 DEEPSPEED_CP_AUX_FILENAME = 'auxiliary.pt'
 
 # initialize distributed backend
@@ -212,24 +231,17 @@ def group_weight(model):
 
 is_shuffle = not distributed_utils.using_backend(distributed_utils.HorovodBackend)
 
-class RealEstate10K(ImageFolder):
-    def __init__(self, root, split, transform=None, target_transform=None):
-        super(RealEstate10K, self).__init__(os.path.join(root, split), transform, target_transform)
-
-    def __getitem__(self, item):
-        x, y = super(RealEstate10K, self).__getitem__(item)
-        return x, y, item
-
-
 ds = RealEstate10K(
     root='./dataset',
     transform=T.Compose([T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
                          T.RandomResizedCrop(IMAGE_SIZE, scale=(args.resize_ratio, 1.), ratio=(1., 1.)),
                          T.ToTensor()
     ]), split='train')
+# filter dataset to contain k (now 15) first frames per video.
 
+# ds = torch.utils.data.Subset(ds, new_indices)
 dalle_params['num_frames'] = len(ds)
-dalle_params['num_videos'] = len(np.unique(ds.targets))
+dalle_params['num_videos'] = ds.num_videos
 assert len(ds) > 0, 'dataset is empty'
 if distr_backend.is_root_worker():
     print(f'{len(ds)} image-text pairs found for training')
@@ -243,16 +255,16 @@ if not is_shuffle:
 else:
     data_sampler = None
 
-dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=is_shuffle, drop_last=True, sampler=data_sampler, num_workers=10)
+dl = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=is_shuffle, drop_last=False, sampler=data_sampler)
 
 # initialize DALL-E
 
 
-dalle = DALLE(vae=vae, **dalle_params, device=DEVICE)
+dalle = DALLE(vae=vae, **dalle_params)
 if not using_deepspeed:
     if args.fp16:
         dalle = dalle.half()
-    dalle = dalle.cuda(DEVICE)
+    dalle = dalle.cuda()
 
 if RESUME and not using_deepspeed:
     dalle.load_state_dict(weights)
@@ -292,11 +304,23 @@ if distr_backend.is_root_worker():
 distr_backend.check_batch_size(BATCH_SIZE)
 deepspeed_config = {
     'train_batch_size': BATCH_SIZE,
+    'gradient_accumulation_steps': args.ga_steps,
     'gradient_clipping': GRAD_CLIP_NORM,
     'fp16': {
         'enabled': args.fp16,
     },
+    'amp': {
+        'enabled': args.amp,
+        'opt_level': 'O1',
+    },
 }
+
+if deepspeed_config.get('zero_optimization', {}).get('stage', 0) >= 2:
+    print(f"Checkpoints made with DeepSpeed ZeRO Stages 2 and 3 will be stored in deepspeed checkpoint folder")
+    print(f"As such, they will require DeepSpeed as a dependency in order to resume from or generate with.")
+    print("See the deespeed conversion script for details on how to convert your ZeRO stage 2/3 checkpoint to a single file.")
+    print("If using a single GPU, consider running with apex automatic mixed precision instead for a similar speedup to ZeRO.")
+    time.sleep(2)
 
 (distr_dalle, distr_opt, distr_dl, distr_scheduler) = distr_backend.distribute(
     args=args,
@@ -338,7 +362,8 @@ def save_model(path):
             ),
         }
         torch.save(save_obj, str(cp_dir / DEEPSPEED_CP_AUX_FILENAME))
-        return
+        if deepspeed_config.get('zero_optimization', {}).get('stage', 0) >= 2: # see https://github.com/lucidrains/DALLE-pytorch/wiki/DeepSpeed-Checkpoints
+            return
 
     if not distr_backend.is_root_worker():
         return
@@ -356,15 +381,17 @@ for epoch in range(EPOCHS):
     if data_sampler:
         data_sampler.set_epoch(epoch)
     for i, (images, video_indices, frame_indices) in enumerate(distr_dl):
+        if i % 10 == 0 and distr_backend.is_root_worker():
+            t = time.time()
         if args.fp16:
             images = images.half()
-        images.cuda(DEVICE)
-        video_indices.cuda(DEVICE)
-        frame_indices.cuda(DEVICE)
+        images = images.cuda()
+        video_indices = video_indices.cuda()
+        frame_indices = frame_indices.cuda()
         # text, images = map(lambda t: t.cuda(), (text, images))
 
-        loss = distr_dalle(images, video_indices, frame_indices, return_loss=True)
-
+        ce_loss, reg_loss = distr_dalle(images, video_indices, frame_indices, return_loss=True)
+        loss = ce_loss + reg_loss
         if using_deepspeed:
             distr_dalle.backward(loss)
             distr_dalle.step()
@@ -382,20 +409,32 @@ for epoch in range(EPOCHS):
 
         if i % 10 == 0 and distr_backend.is_root_worker():
             print(epoch, i, f'loss - {avg_loss.item()}')
-
+            lr = distr_opt.param_groups[0]['lr']
             log = {
                 **log,
                 'epoch': epoch,
                 'iter': i,
-                'loss': avg_loss.item()
+                'loss': avg_loss.item(),
+                'ce_loss': ce_loss,
+                'reg_loss': reg_loss,
+                'lr': lr
             }
 
-        if i % 50 == 0:
+        if i % SAVE_EVERY_N_STEPS == 0:
+            save_model(DALLE_OUTPUT_FILE_NAME)
+
+        if i % 1000 == 0:
             if distr_backend.is_root_worker():
                 if not avoid_model_calls:
                     # CUDA index errors when we don't guard this
-                    image = dalle.generate_images(frame_index=frame_indices[:1],
-                                                  video_index=video_indices[:1], filter_thres=0.9)  # topk sampling at 0.9
+                    dalle_recon = dalle.generate_images(frame_index=frame_indices[:2],
+                                                        video_index=video_indices[:2],
+                                                        filter_thres=0.99).cpu()  # topk sampling at 0.9
+                    crossovers = dalle.generate_images(frame_index=torch.flip(frame_indices[:2], (0,)),
+                                                       video_index=video_indices[:2],
+                                                       filter_thres=0.99).cpu()  # topk sampling at 0.9
+                    codes = vae.get_codebook_indices(images[:2])
+                    vae_recon = vae.decode(codes).detach().cpu()
 
                 wandb.save(f'./dalle.pt')
 
@@ -403,10 +442,23 @@ for epoch in range(EPOCHS):
                     **log,
                 }
                 if not avoid_model_calls:
-                    log['image'] = wandb.Image(image,caption=[str(i)])
-                    log['orig_image'] = wandb.Image(images[:1],caption=[str(i)])
+                    vid1_id = int(video_indices[0].cpu())
+                    vid2_id = int(video_indices[1].cpu())
+                    frame1_id = int(frame_indices[0].cpu())
+                    frame2_id = int(frame_indices[1].cpu())
 
-            save_model(f'./dalle.pt')
+                    grid = torchvision.utils.make_grid(torch.cat([images[:2].cpu(), vae_recon, dalle_recon, crossovers], dim=0), nrow=2)
+                    log['all'] = wandb.Image(grid)
+                    log['vae'] = wandb.Image(torchvision.utils.make_grid(vae_recon, nrow=1))
+                    log['dalle'] = wandb.Image(torchvision.utils.make_grid(dalle_recon, nrow=1))
+                    log['image'] = wandb.Image(torchvision.utils.make_grid(images[:2], nrow=1))
+                    # log['orig_image2'] = wandb.Image(images[1:2],caption=[f"{vid2_id}, {frame2_id}"])
+
+
+        if i % 10 == 9 and distr_backend.is_root_worker():
+            sample_per_sec = BATCH_SIZE * 10 / (time.time() - t)
+            log["sample_per_sec"] = sample_per_sec
+            print(epoch, i, f'sample_per_sec - {sample_per_sec}')
 
         if distr_backend.is_root_worker():
             wandb.log(log)
@@ -414,20 +466,22 @@ for epoch in range(EPOCHS):
     if LR_DECAY and not using_deepspeed:
         # Scheduler is automatically progressed after the step when
         # using DeepSpeed.
-        distr_scheduler.step(loss)
+        distr_scheduler.step(avg_loss)
+
+    save_model(DALLE_OUTPUT_FILE_NAME)
 
     if distr_backend.is_root_worker():
         # save trained model to wandb as an artifact every epoch's end
+        pass
+        # model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
+        # model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
+        # run.log_artifact(model_artifact)
 
-        model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
-        model_artifact.add_file('dalle.pt')
-        run.log_artifact(model_artifact)
-
-save_model(f'./dalle-final.pt')
+save_model(DALLE_OUTPUT_FILE_NAME)
 if distr_backend.is_root_worker():
-    wandb.save('./dalle-final.pt')
+    wandb.save(DALLE_OUTPUT_FILE_NAME)
     model_artifact = wandb.Artifact('trained-dalle', type='model', metadata=dict(model_config))
-    model_artifact.add_file('dalle-final.pt')
+    model_artifact.add_file(DALLE_OUTPUT_FILE_NAME)
     run.log_artifact(model_artifact)
 
     wandb.finish()
