@@ -30,7 +30,7 @@ parser.add_argument('--image_folder', type = str,
                     help='path to your folder of images for learning the discrete VAE and its codebook')
 
 parser.add_argument('--pretrained_path', type = str,
-                    default ='vae_17Jun_0950.pt',
+                    default ='vae_18Jun_1240.pt',
                     help='path to pretrained model')
 
 parser.add_argument('--image_size', type = int, required = False, default = 128,
@@ -41,18 +41,18 @@ parser.add_argument('--random_resize_crop_lower_ratio', dest='resize_ratio', typ
 parser = distributed_utils.wrap_arg_parser(parser)
 
 parser.add_argument('--output_model_name', type = str,
-                    default ='vae_17Jun_1720',
-                    help='path to pretrained model')
+                    default ='vae_20Jun_2000_kl_1_decay0995',
+                    help='output model path')
 
 train_group = parser.add_argument_group('Training settings')
 
-train_group.add_argument('--epochs', type = int, default = 1000, help = 'number of epochs')
+train_group.add_argument('--epochs', type = int, default = 200, help = 'number of epochs')
 
-train_group.add_argument('--batch_size', type = int, default = 64, help = 'batch size')
+train_group.add_argument('--batch_size', type = int, default = 96, help = 'batch size')
 
-train_group.add_argument('--learning_rate', type = float, default = 1e-3, help = 'learning rate')
+train_group.add_argument('--learning_rate', type = float, default = 1e-4, help = 'learning rate')
 
-train_group.add_argument('--lr_decay_rate', type = float, default = 0.98, help = 'learning rate decay')
+train_group.add_argument('--lr_decay_rate', type = float, default = 0.995, help = 'learning rate decay')
 
 train_group.add_argument('--starting_temp', type = float, default = 1., help = 'starting temperature')
 
@@ -308,9 +308,9 @@ for epoch in range(EPOCHS):
 
     if distr_backend.is_root_worker():
         # save trained model to wandb as an artifact every epoch's end
-
-        model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
-        model_artifact.add_file(f'{OUTPUT_MODEL_NAME}.pt')
+        pass
+        # model_artifact = wandb.Artifact('trained-vae', type = 'model', metadata = dict(model_config))
+        # model_artifact.add_file(f'{OUTPUT_MODEL_NAME}.pt')
         # run.log_artifact(model_artifact)
 
 if distr_backend.is_root_worker():

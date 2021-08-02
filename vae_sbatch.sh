@@ -8,4 +8,4 @@ dir=/cs/labs/daphna/avihu.dekel/DALLE-pytorch/
 cd $dir
 source /cs/labs/daphna/avihu.dekel/env/bin/activate
 module load torch
-python train_vae.py --kl_loss_weight 0.01
+python train_vae.py --kl_loss_weight 0.01 --learning_rate 0.00004
