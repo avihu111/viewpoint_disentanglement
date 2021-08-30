@@ -9,7 +9,7 @@ from einops import rearrange
 from dalle_pytorch.reversible import ReversibleSequence, SequentialSequence
 from dalle_pytorch.attention import Attention, SparseAttention, SparseConvCausalAttention, SparseAxialCausalAttention
 
-from g_mlp_pytorch import gMLPBlock
+
 
 # helpers
 
@@ -118,6 +118,7 @@ class Transformer(nn.Module):
             elif attn_type == 'conv_like':
                 attn_class = partial(SparseConvCausalAttention, seq_len = seq_len, image_size = image_fmap_size, stable = stable)
             elif attn_type == 'mlp':
+                from g_mlp_pytorch import gMLPBlock
                 attn_class = partial(gMLPBlock, seq_len = seq_len)
             else:
                 raise ValueError(f'attention type "{attn_type}" is not valid')

@@ -11,8 +11,7 @@ import yaml
 from pathlib import Path
 from tqdm import tqdm
 from math import sqrt
-from omegaconf import OmegaConf
-from taming.models.vqgan import VQModel
+
 
 import torch
 from torch import nn
@@ -138,7 +137,8 @@ class VQGanVAE1024(nn.Module):
 
         download(VQGAN_VAE_CONFIG_PATH, config_filename)
         download(VQGAN_VAE_PATH, model_filename)
-
+        from omegaconf import OmegaConf
+        from taming.models.vqgan import VQModel
         config = OmegaConf.load(str(Path(CACHE_PATH) / config_filename))
         model = VQModel(**config.model.params)
 
@@ -192,12 +192,13 @@ class VQGanVAE16384(nn.Module):
     def __init__(self):
         super().__init__()
 
-        model_filename = 'vqgan.16384.model.ckpt'
+        model_filename = 'vq_realestate.ckpt'
         config_filename = 'vqgan.16384.config.yml'
 
         download(VQGAN_VAE_CONFIG_PATH, config_filename)
         download(VQGAN_VAE_PATH, model_filename)
-
+        from omegaconf import OmegaConf
+        from taming.models.vqgan import VQModel
         config = OmegaConf.load(str(Path(CACHE_PATH) / config_filename))
         model = VQModel(**config.model.params)
 
@@ -245,3 +246,7 @@ class VQGanVAE16384(nn.Module):
 
     def forward(self, img):
         raise NotImplemented
+
+
+if __name__ == '__main__':
+    VQGanVAE1024()

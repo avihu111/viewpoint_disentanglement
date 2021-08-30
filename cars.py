@@ -22,6 +22,7 @@ class Cars3D(VisionDataset):
 					self.contents[img_idx] = elevation * 24 + azimuth
 		self.return_indices = return_indices
 		self.num_classes = len(np.unique(self.classes))
+		self.targets = self.classes
 
 	def __getitem__(self, item):
 		img = self.imgs[item]

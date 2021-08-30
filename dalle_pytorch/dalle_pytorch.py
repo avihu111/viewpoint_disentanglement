@@ -3,12 +3,12 @@ import torch
 from torch import nn, einsum
 import torch.nn.functional as F
 
-from axial_positional_embedding import AxialPositionalEmbedding
+
 from einops import rearrange
 
 from dalle_pytorch import distributed_utils
 from dalle_pytorch.vae import OpenAIDiscreteVAE
-from dalle_pytorch.vae import VQGanVAE1024
+from dalle_pytorch.vae import VQGanVAE1024, VQGanVAE16384
 from dalle_pytorch.transformer import Transformer
 
 
@@ -346,7 +346,7 @@ class DALLE(nn.Module):
             num_videos=10, sigma=1, regularization=0.001
     ):
         super().__init__()
-        assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE1024)), 'vae must be an instance of DiscreteVAE'
+        assert isinstance(vae, (DiscreteVAE, OpenAIDiscreteVAE, VQGanVAE1024, VQGanVAE16384)), 'vae must be an instance of DiscreteVAE'
         num_image_tokens = vae.num_tokens
         image_fmap_size = (vae.image_size // (2 ** vae.num_layers))
         image_seq_len = image_fmap_size ** 2
@@ -356,6 +356,7 @@ class DALLE(nn.Module):
         self.per_video_emb = nn.Embedding(num_videos, dim * (text_seq_len - 1))
         self.image_emb = nn.Embedding(num_image_tokens, dim)
         self.text_pos_emb = nn.Embedding(text_seq_len + 1, dim)  # +1 for <bos>
+        from axial_positional_embedding import AxialPositionalEmbedding
         self.image_pos_emb = AxialPositionalEmbedding(dim, axial_shape=(image_fmap_size, image_fmap_size))
         self.num_image_tokens = num_image_tokens
         self.text_seq_len = text_seq_len + 1
@@ -369,7 +370,7 @@ class DALLE(nn.Module):
         self.vae = vae
         set_requires_grad(self.vae, False)  # freeze VAE from being trained
 
-        self.transformer = Transformer(
+        self.generator = Transformer(
             dim=dim,
             causal=True,
             seq_len=seq_len,
@@ -415,6 +416,8 @@ class DALLE(nn.Module):
 
         return images
 
+    @torch.no_grad()
+    @eval_decorator
     def interpolate_images(
             self,
             frame_index1, frame_index2,
@@ -435,6 +438,37 @@ class DALLE(nn.Module):
         frame_embs = interpolator * frame_emb1 + (1 - interpolator) * frame_emb2
         video_embs = torch.ones_like(interpolator) * video_emb
         out = torch.zeros((len(frame_embs), self.image_seq_len), dtype=frame_index1.dtype).cuda(device)
+        for cur_len in range(image_seq_len):
+            logits = self.get_logits(image=out[:, :cur_len + text_seq_len], frame_embs=frame_embs, rel_codes=None,
+                                     video_embs=video_embs)[1][:, cur_len + text_seq_len - 1, :]
+
+            filtered_logits = top_k(logits, thres=filter_thres)
+            probs = F.softmax(filtered_logits / temperature, dim=-1)
+            sample = torch.multinomial(probs, 1)
+            out[:, cur_len] = sample[:, 0]
+
+        img_seq = out[:, -image_seq_len:]
+        images = vae.decode(img_seq)
+
+        return images
+
+    @torch.no_grad()
+    @eval_decorator
+    def sample_random_image(
+            self,
+            video_index, sigma, num_images,
+            *,
+            filter_thres=0.5,
+            temperature=1., interpolation_num=10
+    ):
+        vae, text_seq_len, image_seq_len, = self.vae, self.text_seq_len, self.image_seq_len
+        device = video_index.device
+        bs = len(video_index)
+        video_emb = self.per_video_emb(video_index).view(bs, -1, self.dim)
+        video_embs = torch.ones(size=(num_images, 1, 1)).to(device) * video_emb
+        frame_embs = torch.normal(mean=0, std=sigma, size=(num_images, 1, self.dim)).to(device)
+
+        out = torch.zeros((num_images, self.image_seq_len,), dtype=video_index.dtype).cuda(device)
         for cur_len in range(image_seq_len):
             logits = self.get_logits(image=out[:, :cur_len + text_seq_len], frame_embs=frame_embs, rel_codes=None,
                                      video_embs=video_embs)[1][:, cur_len + text_seq_len - 1, :]
@@ -501,7 +535,7 @@ class DALLE(nn.Module):
         if tokens.shape[1] > self.total_seq_len:
             seq_len -= 1
             tokens = tokens[:, :-1]
-        out = self.transformer(tokens)
+        out = self.generator(tokens)
         logits = self.to_logits(out)
         return image, logits
 
